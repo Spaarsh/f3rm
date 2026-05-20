@@ -104,6 +104,18 @@ class FeatureDataManager(VanillaDataManager):
     def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
         """Nearest neighbor interpolation of features"""
         ray_bundle, batch = super().next_train(step)
+        # After obtaining ray_bundle, batch from super()
+        # If sampler-provided pixel_area exists, prefer that (ensure correct device/shape)
+        if "pixel_area" in batch:
+            print(f"Using sampler-provided pixel_area with shape {batch['pixel_area'].shape} and device {batch['pixel_area'].device}")
+            # Ensure device/dtype/shape match RayBundle expectations: [..., 1]
+            pa = batch["pixel_area"].to(ray_bundle.origins.device).float().reshape(-1, 1)
+            ray_bundle.pixel_area = pa
+        else:
+            # Scale camera per-pixel pixel_area to patch area (patch pixels = 1/(scale_h * scale_w))
+            # Example: if scale_h = feat_h / im_h = 24 / 720 = 1/30, then patch height in pixels = 1/scale_h = 30.
+            patch_pixel_count = 1.0 / (self.scale_h * self.scale_w)
+            ray_bundle.pixel_area = ray_bundle.pixel_area * float(patch_pixel_count)
         ray_indices = batch["indices"]
         camera_idx = ray_indices[:, 0]
         y_idx = (ray_indices[:, 1] * self.scale_h).long()

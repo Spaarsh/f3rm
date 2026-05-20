@@ -10,8 +10,10 @@ from f3rm.features.clip_extract import CLIPArgs, extract_clip_features
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _IMAGE_DIR = os.path.join(_MODULE_DIR, "images")
+IMAGE_DIR = "/home/spaarsht/new-nerf/f3rm/datasets/f3rm/panda/scene_001/images"
+image_paths = [os.path.join(IMAGE_DIR, name) for name in ["frame_00001.jpg", "frame_00040.jpg", "frame_00017.jpg"]]
 
-image_paths = [os.path.join(_IMAGE_DIR, name) for name in ["frame_1.png", "frame_2.png", "frame_3.png"]]
+#[os.path.join(_IMAGE_DIR, name) for name in ["frame_1.png", "frame_2.png", "frame_3.png"]]
 
 
 @torch.no_grad()
@@ -60,4 +62,4 @@ def demo_clip_features(text_query: str) -> None:
 
 
 if __name__ == "__main__":
-    demo_clip_features(text_query="teddy bear")
+    demo_clip_features(text_query="baymax")

@@ -6,7 +6,7 @@ from einops import rearrange
 from PIL import Image
 from torchvision.transforms import CenterCrop, Compose
 from tqdm import tqdm
-
+import time
 
 class CLIPArgs:
     model_name: str = "ViT-L/14@336px"
@@ -21,14 +21,46 @@ class CLIPArgs:
             "skip_center_crop": cls.skip_center_crop,
         }
 
+@torch.no_grad()
+def extract_clip_features_optimized(image_paths: List[str], model, preprocess, device: torch.device) -> torch.Tensor:
+    """Optimized feature extractor using a pre-loaded F3RM CLIP model"""
+    from f3rm.features.clip_extract import CLIPArgs
+    from torchvision.transforms import CenterCrop, Compose
+    from PIL import Image
+    from einops import rearrange
+
+    if CLIPArgs.skip_center_crop:
+        is_center_crop = [isinstance(t, CenterCrop) for t in preprocess.transforms]
+        if sum(is_center_crop) == 1:
+            preprocess = Compose([t for t in preprocess.transforms if not isinstance(t, CenterCrop)])
+
+    images = [Image.open(path) for path in image_paths]
+    preprocessed_images = torch.stack([preprocess(image) for image in images]).to(device)
+
+    embeddings = []
+    for i in range(0, len(preprocessed_images), CLIPArgs.batch_size):
+        batch = preprocessed_images[i : i + CLIPArgs.batch_size]
+        # Use the f3rm model wrapper method properly
+        embeddings.append(model.get_patch_encodings(batch))
+    embeddings = torch.cat(embeddings, dim=0)
+
+    h_in, w_in = preprocessed_images.shape[-2:]
+    h_out = h_in // model.visual.patch_size
+    w_out = w_in // model.visual.patch_size
+    
+    embeddings = rearrange(embeddings, "b (h w) c -> b h w c", h=h_out, w=w_out)
+    return embeddings
 
 @torch.no_grad()
 def extract_clip_features(image_paths: List[str], device: torch.device) -> torch.Tensor:
     """Extract dense patch-level CLIP features for given images"""
     from f3rm.features.clip import clip
+    torch.cuda.reset_peak_memory_stats()
+    start_mem = torch.cuda.memory_allocated()
 
     model, preprocess = clip.load(CLIPArgs.model_name, device=device)
     print(f"Loaded CLIP model {CLIPArgs.model_name}")
+    clip_start = time.time()
 
     # Patch the preprocess if we want to skip center crop
     if CLIPArgs.skip_center_crop:
@@ -72,7 +104,14 @@ def extract_clip_features(image_paths: List[str], device: torch.device) -> torch
         raise ValueError(f"Unknown CLIP model name: {CLIPArgs.model_name}")
     embeddings = rearrange(embeddings, "b (h w) c -> b h w c", h=h_out, w=w_out)
     print(f"Extracted CLIP embeddings of shape {embeddings.shape}")
+    clip_time = time.time() - clip_start
+    print(f"CLIP feature extraction took {clip_time:.2f} seconds.")
 
+    peak_mem = torch.cuda.max_memory_allocated()
+    end_mem = torch.cuda.memory_allocated()
+
+    print(f"Memory Impact: {(end_mem - start_mem) / 1024**2:.2f} MB")
+    print(f"Peak VRAM Usage: {peak_mem / 1024**2:.2f} MB")
     # Delete and clear memory to be safe
     del model
     del preprocess

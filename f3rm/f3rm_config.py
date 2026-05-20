@@ -9,6 +9,8 @@ from nerfstudio.plugins.types import MethodSpecification
 
 from f3rm.feature_datamanager import FeatureDataManagerConfig
 from f3rm.model import FeatureFieldModelConfig
+from f3rm.data.patch_sampler import PatchGridPixelSampler
+from nerfstudio.data.pixel_samplers import PixelSamplerConfig
 
 f3rm_method = MethodSpecification(
     config=TrainerConfig(
@@ -21,8 +23,12 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=4096,
-                eval_num_rays_per_batch=4096,
+                train_num_rays_per_batch=1008, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
+                eval_num_rays_per_batch=1008, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
+                pixel_sampler=PixelSamplerConfig(
+                    _target=PatchGridPixelSampler,
+                    num_rays_per_batch=1008 # 42 x 24 vit_b_16 patch grid
+                ),
                 camera_optimizer=CameraOptimizerConfig(
                     mode="SO3xR3",
                     optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2),
