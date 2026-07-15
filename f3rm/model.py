@@ -27,6 +27,39 @@ from f3rm.renderer import FeatureRenderer
 import time
 from contextlib import contextmanager
 
+"""
+PATCH for model.py  — 4 targeted changes, nothing else.
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHANGE 1: New import — add after existing imports
+# ══════════════════════════════════════════════════════════════════════════════
+
+from f3rm.retrieval_loss import RetrievalLoss, RetrievalLossConfig
+from f3rm.pose_contrastive_loss import PoseContrastiveLoss, PoseContrastiveLossConfig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHANGE 2: Two new fields in FeatureFieldModelConfig
+# Add these inside the dataclass, after feat_num_layers:
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHANGE 3: Instantiate loss in populate_modules()
+# Add at the END of populate_modules(), after the self.field.forward = ... line
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHANGE 4: Replace get_loss_dict() entirely
+# ══════════════════════════════════════════════════════════════════════════════
+
+from collections import defaultdict
+# add a module-level timing store: {name -> [elapsed_ms, ...]}
+PROFILE_TIMINGS = defaultdict(list)
 @contextmanager
 def profile_cuda(name: str):
     """Context manager to measure exact CUDA execution time."""
@@ -41,7 +74,8 @@ def profile_cuda(name: str):
     
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print(f"[Profile] {name:<30} : {elapsed_time_ms:>8.2f} ms")
+    PROFILE_TIMINGS[name].append(elapsed_time_ms)
+    #print(f"[Profile] {name:<30} : {elapsed_time_ms:>8.2f} ms")
 
 @dataclass
 class FeatureFieldModelConfig(NerfactoModelConfig):
@@ -62,6 +96,17 @@ class FeatureFieldModelConfig(NerfactoModelConfig):
     # Feature Field MLP Head
     feat_hidden_dim: int = 64
     feat_num_layers: int = 2
+
+    # Retrieval loss params (added)
+    retrieval_loss_weight: float = 1e-2
+    retrieval_loss_config: RetrievalLossConfig = field(default_factory=RetrievalLossConfig)
+
+    # Pose contrastive loss params (added)
+    pose_contrastive_loss_weight: float = 1e-2
+    """Weight for the cross-pose contrastive loss. Set to 0.0 to disable."""
+    pose_contrastive_loss_config: PoseContrastiveLossConfig = field(
+        default_factory=PoseContrastiveLossConfig
+    )
 
 
 @dataclass
@@ -146,7 +191,7 @@ class FeatureFieldModel(NerfactoModel):
         super().populate_modules()
 
         # Create feature field
-        feature_dim = 768 #self.kwargs["metadata"]["feature_dim"]
+        feature_dim = 1024 #self.kwargs["metadata"]["feature_dim"]
         if feature_dim <= 0:
             raise ValueError(f"Feature dimensionality must be positive, not {feature_dim}")
 
@@ -165,6 +210,64 @@ class FeatureFieldModel(NerfactoModel):
         )
         self.renderer_feature = FeatureRenderer()
         self.setup_gui()
+        
+        # Store the original forward method of the MLP head
+        original_mlp_forward = self.field.mlp_head.forward
+
+        # 1. Create a profiled forward method for training
+        def profiled_mlp_forward(*args, **kwargs):
+            with profile_cuda("   [Layer] Base Color MLP (3 Layers)"):
+                return original_mlp_forward(*args, **kwargs)
+
+        # 2. Create a dummy/cheap forward method for skipping
+        def dummy_mlp_forward(in_tensor):
+            # tinycudann expects a specific output shape matching its configuration.
+            # We fetch n_output_dims dynamically so tinycudann doesn't throw a shape error.
+            out_dim = self.field.mlp_head.tcnn_encoding.n_output_dims
+            return torch.zeros((*in_tensor.shape[:-1], out_dim), device=in_tensor.device)
+
+        # Wrap the main field forward pass to split the profiling
+        original_field_forward = self.field.forward
+
+        def profiled_field_forward(ray_samples, compute_normals=False):
+            # --- STEP A: Profile the HashGrid + Density MLP ---
+            with profile_cuda("   [Layer] Base HashGrid + Density MLP"):
+                # Force the MLP head to return zeros instantly so its execution time is practically 0
+                self.field.mlp_head.forward = dummy_mlp_forward
+                outputs = original_field_forward(ray_samples, compute_normals=compute_normals)
+            
+            # --- STEP B: Run/Profile or Skip the Color MLP Head ---
+            if self.training:
+                # In training mode, run and measure the real layers
+                self.field.mlp_head.forward = profiled_mlp_forward
+                outputs = original_field_forward(ray_samples, compute_normals=compute_normals)
+            else:
+                self.field.mlp_head.forward = profiled_mlp_forward
+                outputs = original_field_forward(ray_samples, compute_normals=compute_normals)
+                # In eval/viewer mode, we do nothing else! 
+                # The outputs dictionary already contains the dummy zeros from Step A.
+                pass
+                
+            # Restore the original forward method for the next loop execution
+            self.field.mlp_head.forward = original_mlp_forward
+            return outputs
+
+        """# Inject our wrapper into the model's field
+        self.field.forward = profiled_field_forward
+        # Backwards-compatible: some saved configs may not contain retrieval_loss_config.
+        retrieval_cfg = getattr(self.config, "retrieval_loss_config", None)
+        if retrieval_cfg is None:
+            # lazy-import the default config if missing
+            from f3rm.retrieval_loss import RetrievalLossConfig as _RetrievalLossConfig
+            retrieval_cfg = _RetrievalLossConfig()
+        self.retrieval_loss_fn = RetrievalLoss(retrieval_cfg)"""
+
+        # Backwards-compatible: some saved configs may not contain_contrastive_loss_config.
+        pose_cfg = getattr(self.config, "pose_contrastive_loss_config", None)
+        if pose_cfg is None:
+            from f3rm.pose_contrastive_loss import PoseContrastiveLossConfig as _PoseContrastiveLossConfig
+            pose_cfg = _PoseContrastiveLossConfig()
+        self.pose_contrastive_loss_fn = PoseContrastiveLoss(pose_cfg)
 
     def setup_gui(self):
         viewer_utils.device = self.kwargs["device"]
@@ -196,7 +299,91 @@ class FeatureFieldModel(NerfactoModel):
         param_groups["feature_field"] = list(self.feature_field.parameters())
         return param_groups
 
+    """def get_outputs(self, ray_bundle: RayBundle):
+        ray_samples: RaySamples
+        
+        # 1. Proposal Sampler
+        with profile_cuda("Proposal Sampler"):
+            ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
+                ray_bundle, density_fns=self.density_fns
+            )
+            
+        # 2. Main NeRF Field Forward Pass
+        with profile_cuda("Base Field Forward"):
+            if self.training:
+                field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+            else:
+                # CRITICAL: We only fetch density and skip the color calculations entirely
+                density_embedding = self.field.get_density(ray_samples)
+                field_outputs = {
+                    FieldHeadNames.DENSITY: density_embedding[0]
+                }
 
+            if self.config.use_gradient_scaling:
+                field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+
+        # 3. Weights calculation
+        with profile_cuda("Weights Generation"):
+            weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+            weights_list.append(weights)
+            ray_samples_list.append(ray_samples)
+
+        # 4. Standard Renderers (Bypassing RGB entirely when evaluating)
+        with profile_cuda("Standard Rendering (Depth Only)"):
+            if self.training:
+                # We still need standard color pipelines during training
+                rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
+            
+            with torch.no_grad():
+                depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+            expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
+            accumulation = self.renderer_accumulation(weights=weights)
+
+        # 5. Feature Field Forward Pass
+        with profile_cuda("Feature Field Forward"):
+            ff_outputs = self.feature_field(ray_samples)
+            
+        # 6. Feature Rendering Pass
+        with profile_cuda("Feature Volume Rendering"):
+            features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
+
+        # 7. Build Output Dictionary
+        outputs = {
+            "accumulation": accumulation,
+            "depth": depth,
+            "expected_depth": expected_depth,
+            "feature": features,
+        }
+        
+        # Only inject the RGB canvas if we are training
+        if self.training:
+            outputs["rgb"] = rgb
+
+        if self.config.predict_normals:
+            normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
+            pred_normals = self.renderer_normals(field_outputs[FieldHeadNames.PRED_NORMALS], weights=weights)
+            outputs["normals"] = self.normals_shader(normals)
+            outputs["pred_normals"] = self.normals_shader(pred_normals)
+        # These use a lot of GPU memory, so we avoid storing them for eval.
+        if self.training:
+            outputs["weights_list"] = weights_list
+            outputs["ray_samples_list"] = ray_samples_list
+
+        if self.training and self.config.predict_normals:
+            outputs["rendered_orientation_loss"] = orientation_loss(
+                weights.detach(), field_outputs[FieldHeadNames.NORMALS], ray_bundle.directions
+            )
+
+            outputs["rendered_pred_normal_loss"] = pred_normal_loss(
+                weights.detach(),
+                field_outputs[FieldHeadNames.NORMALS].detach(),
+                field_outputs[FieldHeadNames.PRED_NORMALS],
+            )
+
+        for i in range(self.config.num_proposal_iterations):
+            outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
+
+        return outputs"""
 
     def get_outputs(self, ray_bundle: RayBundle):
         """Modified from nerfacto.get_outputs with granular CUDA profiling."""
@@ -210,23 +397,31 @@ class FeatureFieldModel(NerfactoModel):
             
         # 2. Main NeRF Field Forward Pass
         with profile_cuda("Base Field Forward"):
-            field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+            if self.training:
+                field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+            else:
+                density_embedding = self.field.get_density(ray_samples)
+                field_outputs = {
+                    FieldHeadNames.DENSITY: density_embedding[0]
+                }
             if self.config.use_gradient_scaling:
                 field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
         # 3. Weights calculation
         with profile_cuda("Weights Generation"):
             weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
-            weights_list.append(weights)
-            ray_samples_list.append(ray_samples)
+            if self.training:
+                weights_list.append(weights)
+                ray_samples_list.append(ray_samples)
 
-        # 4. Standard Renderers (RGB, Depth, Accumulation)
-        with profile_cuda("Standard Rendering (RGB/Depth)"):
-            rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
-            with torch.no_grad():
-                depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
-            expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
-            accumulation = self.renderer_accumulation(weights=weights)
+        # 4. Standard Renderers (RGB, Depth, Accumulation) - Fully bypassed in Evaluation
+        if self.training:
+            with profile_cuda("Standard Rendering (RGB/Depth)"):
+                rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
+                with torch.no_grad():
+                    depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+                expected_depth = self.renderer_expected_depth(weights=weights, ray_samples=ray_samples)
+                accumulation = self.renderer_accumulation(weights=weights)
 
         # 5. Feature Field Forward Pass
         with profile_cuda("Feature Field Forward"):
@@ -235,6 +430,12 @@ class FeatureFieldModel(NerfactoModel):
         # 6. Feature Rendering Pass
         with profile_cuda("Feature Volume Rendering"):
             features = self.renderer_feature(features=ff_outputs[FeatureFieldHeadNames.FEATURE], weights=weights)
+
+        # Return Early during inference/evaluation to avoid processing residual data
+        if not self.training:
+            return {
+                "feature": features
+            }
 
         outputs = {
             "rgb": rgb,
@@ -252,11 +453,10 @@ class FeatureFieldModel(NerfactoModel):
                 outputs["normals"] = self.normals_shader(normals)
                 outputs["pred_normals"] = self.normals_shader(pred_normals)
                 
-            if self.training:
-                outputs["weights_list"] = weights_list
-                outputs["ray_samples_list"] = ray_samples_list
+            outputs["weights_list"] = weights_list
+            outputs["ray_samples_list"] = ray_samples_list
 
-            if self.training and self.config.predict_normals:
+            if self.config.predict_normals:
                 outputs["rendered_orientation_loss"] = orientation_loss(
                     weights.detach(), field_outputs[FieldHeadNames.NORMALS], ray_bundle.directions
                 )
@@ -336,9 +536,45 @@ class FeatureFieldModel(NerfactoModel):
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
-        # Compute feature loss
+ 
+        # Existing feature reconstruction loss (MSE)
         target_feats = batch["feature"].to(self.device)
-        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(outputs["feature"], target_feats)
+        loss_dict["feature_loss"] = self.config.feat_loss_weight * F.mse_loss(
+            outputs["feature"], target_feats
+        )
+ 
+        # Contrastive retrieval loss
+        if (
+            self.config.retrieval_loss_weight > 0.0
+            and "retrieval_annotations" in batch
+        ):
+            # Combine local step annotations and global batch tokens safely
+            ret_loss = self.retrieval_loss_fn(
+                features     = outputs["feature"],          
+                ray_cam_idx  = batch["ray_cam"],            
+                ray_y        = batch["feat_y"],             
+                ray_x        = batch["feat_x"],             
+                annotations  = batch["retrieval_annotations"],
+                global_annotations = batch.get("global_retrieval_annotations", [])
+            )
+            loss_dict["retrieval_loss"] = (
+                self.config.retrieval_loss_weight * ret_loss
+            )
+
+        # Pose contrastive loss: pulls a pose's rendered feature toward its own
+        # target feature and pushes it away from other poses' target features,
+        # using every other camera present in the current batch as negatives.
+        if self.config.pose_contrastive_loss_weight > 0.0 and "indices" in batch:
+            camera_idx = batch["indices"][:, 0].to(self.device)
+            pose_loss = self.pose_contrastive_loss_fn(
+                pred_features=outputs["feature"],
+                target_features=target_feats,
+                camera_idx=camera_idx,
+            )
+            loss_dict["pose_contrastive_loss"] = (
+                self.config.pose_contrastive_loss_weight * pose_loss
+            )
+        
         return loss_dict
 
     @torch.no_grad()

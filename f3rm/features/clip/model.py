@@ -262,7 +262,7 @@ class VisionTransformer(nn.Module):
 
         self.patch_size = patch_size
 
-    def forward(self, x: torch.Tensor, patch_output: bool = False):
+    def forward(self, x: torch.Tensor, patch_output: bool = True):
         _, _, w, h = x.shape
 
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -275,19 +275,22 @@ class VisionTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
 
         if patch_output:
+            # 1. Feed through the transformer blocks but stop right before the last layer
             *layers, last_resblock = self.transformer.resblocks
             penultimate = nn.Sequential(*layers)
-
             x = penultimate(x)
-            x = last_resblock.forward_v(x)
+            
+            # 2. Permute from sequence-first (LND) to batch-first (NLD)
             x = x.permute(1, 0, 2)  # LND -> NLD
 
-            # Extract the patch tokens, not the class token
+            # 3. Extract the patch tokens, skipping the CLS token
             x = x[:, 1:, :]
+            
+            # 4. Apply final layer norm and project to CLIP text embedding space (768-dim)
             x = self.ln_post(x)
-            if self.proj is not None:
-                # This is equivalent to conv1d
-                x = x @ self.proj
+            
+            # Return the 576 spatial patch tokens directly at their native 1024 dimension!
+            # (Excluding the index 0 class embedding token to match LLaVA's layout)
             return x
 
         x = self.transformer(x)

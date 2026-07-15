@@ -23,12 +23,12 @@ f3rm_method = MethodSpecification(
             datamanager=FeatureDataManagerConfig(
                 feature_type="CLIP",
                 dataparser=NerfstudioDataParserConfig(train_split_fraction=0.95),
-                train_num_rays_per_batch=1008, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
-                eval_num_rays_per_batch=1008, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
-                pixel_sampler=PixelSamplerConfig(
-                    _target=PatchGridPixelSampler,
-                    num_rays_per_batch=1008 # 42 x 24 vit_b_16 patch grid
-                ),
+                train_num_rays_per_batch=4096, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
+                eval_num_rays_per_batch=4096, #formerly 4096, we reduce this to 1008 to mimic ViT patches.
+                #pixel_sampler=PixelSamplerConfig(
+                #    _target=PatchGridPixelSampler,
+                #    num_rays_per_batch=576 # 42 x 24 vit_b_16 patch grid
+                #),
                 camera_optimizer=CameraOptimizerConfig(
                     mode="SO3xR3",
                     optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2),
